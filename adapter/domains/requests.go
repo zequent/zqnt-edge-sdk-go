@@ -94,6 +94,9 @@ type CustomCommandRequest struct {
 	CommandID string
 	TargetRef *string
 	Params    map[string]any
+	// CommandExecutionID is the platform's id of this run (v3). Report the command's progress and
+	// completion under it; empty on the v2 path, where TID carries it.
+	CommandExecutionID string
 }
 
 // GetDetectionsRequest is the payload for a GetDetections server-streaming call.
@@ -109,6 +112,16 @@ type DetectionResult struct {
 	ObjectType  string
 	Confidence  float32
 	BoundingBox BoundingBox
+	// Position is where the object is, when the detector can tell.
+	Position *GeoPoint
+	// RangeMeters, BearingDegrees (clockwise from true north) and ElevationDegrees locate the
+	// object relative to the sensor that saw it, as a radar reports it.
+	RangeMeters      *float64
+	BearingDegrees   *float64
+	ElevationDegrees *float64
+	// Speed (m/s) and HeadingDegrees (clockwise from true north) of the object when the sensor tracks it.
+	Speed          *float64
+	HeadingDegrees *float64
 }
 
 // BoundingBox holds the pixel coordinates of a detected object.
