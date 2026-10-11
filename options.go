@@ -47,6 +47,12 @@ func WithEdgeToken(token string) Option {
 	return func(c *config) { c.auth.EdgeToken = token }
 }
 
+// WithClaimCode sets the one-time pairing code EnsureAsset redeems for an asset the platform does
+// not know yet (default: ZQNT_CLAIM_CODE). The claim decides the asset's organization.
+func WithClaimCode(code string) Option {
+	return func(c *config) { c.claimCode = code }
+}
+
 // WithPlatformPublicKey sets the platform's service public key the adapter's server verifies
 // every command with (default: ZQNT_PLATFORM_PUBLIC_KEY / SERVICE_AUTH_PUBLIC_KEY).
 func WithPlatformPublicKey(key string) Option {
@@ -77,4 +83,10 @@ func WithLiveDataAddr(addr string) Option {
 // WithConnectorAddr.
 func WithMissionAutonomyAddr(addr string) Option {
 	return func(c *config) { c.missionAutonomyAddr = addr }
+}
+
+// WithRemoteControlAddr dials remote-control (v3 EdgeGatewayService: command events and
+// capability reports) at addr instead of the main endpoint. See WithConnectorAddr.
+func WithRemoteControlAddr(addr string) Option {
+	return func(c *config) { c.remoteControlAddr = addr }
 }

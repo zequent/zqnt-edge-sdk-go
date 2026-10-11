@@ -67,7 +67,28 @@ type Capability struct {
 	Source CapabilitySource
 	// Provider is the human-readable origin shown in the catalog, e.g. "DJI Adapter".
 	Provider string
+	// Completion says whether the reply finishes the command (CompletionOnReply: a cover, a
+	// light) or a later CommandExecutionEvent does (CompletionAsynchronous: take-off, go-to, return
+	// home, a mission). Left unset, a result with an ExternalExecutionID waits and any other
+	// success is done. Not the same as Events, which list what a Skill can react to.
+	Completion CompletionMode
+	// CompletionEvent names, for CompletionAsynchronous, the event in Events that reports the
+	// outcome, e.g. "flight.takeoff.completed".
+	CompletionEvent string
+	// Safety is the command's risk. Left nil, a standard command id is advertised with its
+	// CatalogSafety; any other id declares none and the platform falls back to the 2.x prefix rule.
+	Safety *CommandSafety
 }
+
+// CompletionMode is when a command is finished, as far as the platform can tell. The values
+// match zqnt.capability.v3.CompletionMode.
+type CompletionMode int
+
+const (
+	CompletionUnspecified  CompletionMode = 0
+	CompletionOnReply      CompletionMode = 1
+	CompletionAsynchronous CompletionMode = 2
+)
 
 // CapabilityError is one failure code a command's execution can end in -- part of the contract
 // alongside the schemas, so a caller knows what can go wrong without probing the device.
@@ -118,6 +139,52 @@ type CurrentCapabilities struct {
 	AssetType    string
 	Capabilities []Capability
 	Timestamp    time.Time
+	// TelemetryFields are the device-specific values this asset sends in TelemetrySample.Details.
+	TelemetryFields []TelemetryField
+	// Payloads are the devices mounted on the asset, a full snapshot: one left out of the next
+	// report is detached.
+	Payloads []Payload
+}
+
+// Payload is a device mounted on the asset: camera, gimbal, speaker, spotlight, sprayer, sensor.
+type Payload struct {
+	// Ref is stable within the asset; a command acting on this payload has TargetType
+	// CapabilityTargetPayload and TargetRef Ref.
+	Ref string
+	// Kind is "camera", "speaker", "spotlight", "sprayer", "sensor", ...
+	Kind         string
+	Vendor       string
+	Model        string
+	SerialNumber string
+	// SlotIndex is the mount position, e.g. DJI gimbal 0..2; nil when the asset has no slots.
+	SlotIndex       *int32
+	FirmwareVersion string
+	// ExternalID is the vendor's id, e.g. DJI "type-subtype-gimbalindex".
+	ExternalID string
+	// MountedOn is the ref of the sub-asset carrying the payload; empty means the asset itself.
+	MountedOn string
+	Metadata  map[string]string
+}
+
+// TelemetryValueType is the type of one declared telemetry detail.
+type TelemetryValueType int
+
+const (
+	TelemetryValueUnspecified TelemetryValueType = iota
+	TelemetryValueNumber
+	TelemetryValueString
+	TelemetryValueBoolean
+)
+
+// TelemetryField declares one key the asset sends in TelemetrySample.Details.
+type TelemetryField struct {
+	// Key is dotted, e.g. "dock.cover_state".
+	Key  string
+	Type TelemetryValueType
+	// Unit is SI or common, e.g. "m", "m/s", "%"; empty for strings and booleans.
+	Unit          string
+	Description   string
+	AllowedValues []string
 }
 
 // EmptyCapabilities returns an empty CurrentCapabilities for a given serial number.
