@@ -9,10 +9,12 @@ Go SDK for connecting edge devices (drones, robots) to the Zequent platform via 
 ```bash
 go env -w GONOSUMDB="github.com/Zequent/*,github.com/zequent/*"
 go env -w GONOPROXY="github.com/Zequent/*,github.com/zequent/*"
-go get github.com/Zequent/zqnt-edge-sdk-go/v2@v2.0.0  # proto stubs come from github.com/zequent/zqnt-utils-golang/v2@v2.0.0
+go get github.com/zequent/zqnt-edge-sdk-go/v3@v3.0.0  # proto stubs come from github.com/zequent/zqnt-api-go/v3
 ```
 
-**2. Implement your adapter:**
+**2. Implement your adapter:** embed `adapter.Base` and register each command once — id, input
+and output JSON Schema, handler. The advertised capabilities, v3 `ExecuteCommand` and the v2 typed
+RPCs all come from that registration.
 
 ```go
 package main
@@ -21,33 +23,37 @@ import (
     "context"
     "net"
 
-    edgesdk "github.com/Zequent/zqnt-edge-sdk-go/v2"
-    "github.com/Zequent/zqnt-edge-sdk-go/v2/adapter"
-    "github.com/Zequent/zqnt-edge-sdk-go/v2/adapter/domains"
+    edgesdk "github.com/zequent/zqnt-edge-sdk-go/v3"
+    "github.com/zequent/zqnt-edge-sdk-go/v3/adapter"
+    "github.com/zequent/zqnt-edge-sdk-go/v3/adapter/domains"
 )
 
-// Embed UnimplementedEdgeAdapter — only override the commands your hardware supports.
-// All other commands automatically return NOT_IMPLEMENTED.
-type MyDroneAdapter struct {
-    adapter.UnimplementedEdgeAdapter
+type MyDrone struct {
+    adapter.Base
 }
 
-func (a *MyDroneAdapter) TakeOff(ctx context.Context, req *domains.TakeOffRequest) (*domains.CommandResult, error) {
-    // send takeoff command to your hardware here
-    return domains.SuccessWithTID("ok", req.TID, req.SN), nil
+func (d *MyDrone) takeOff(ctx context.Context, req *domains.CustomCommandRequest) (*domains.CommandResult, error) {
+    altitude := req.Params["altitude"].(float64) // validated against the input schema
+    // send takeoff to your hardware; report completion under req.CommandExecutionID
+    return domains.Success("climbing", req.SN), nil
 }
 
 func main() {
-    client, _ := edgesdk.NewEdgeClient(
-        "your-backend:50051", // Zequent backend address
-        "YOUR-DEVICE-SN",     // device serial number
-        &MyDroneAdapter{},
-    )
+    d := &MyDrone{}
+    d.MustRegisterCommand("flight.takeoff",
+        map[string]any{"type": "object", "required": []any{"altitude"},
+            "properties": map[string]any{"altitude": map[string]any{"type": "number"}}},
+        nil, d.takeOff,
+        adapter.WithCompletion(domains.CompletionAsynchronous, "flight.takeoff.completed"))
 
+    client, _ := edgesdk.NewEdgeClient("your-backend:50051", "YOUR-DEVICE-SN", d)
     lis, _ := net.Listen("tcp", ":9090")
     client.StartServing(context.Background(), lis)
 }
 ```
+
+Adapters written against the typed methods (`adapter.UnimplementedEdgeAdapter` + `TakeOff`, …)
+keep working; those methods are deprecated in favour of the registry.
 
 **3. Run it:**
 
@@ -59,6 +65,63 @@ See [`example/main.go`](example/main.go) for a complete working example with gra
 
 ---
 
+## v3: talking to the platform
+
+| What | v3 (tried first) | Fallback on `UNIMPLEMENTED` (older core) |
+|---|---|---|
+| Commands from the platform | `zqnt.edge.v3.EdgeAdapterService.ExecuteCommand` | v2 typed RPCs, served alongside |
+| Command events (`LiveData().PublishCommandExecutionEvent`) | `EdgeGatewayService.PublishCommandEvent` under the platform's `command_execution_id`, `occurred_at` always set | v2 notification stream |
+| Capabilities (on start, on every registry change, `client.RefreshCapabilities()`) | `EdgeGatewayService.ReportCapabilities`, incl. declared telemetry fields | v2 `ReportAssetRuntime` |
+| `LiveData().PublishTelemetrySample` | `TelemetryIngestService.PublishTelemetry` | v2 `ProduceTelemetry`; catalog keys in `Details` land in their v2 fields, other keys are dropped |
+| `LiveData().PublishDetections` | `TelemetryIngestService.PublishDetections` | v2 `ProduceDetection` |
+| `LiveData().PublishAlert` | `TelemetryIngestService.PublishAlerts` | none: dropped |
+
+After `UNIMPLEMENTED` the SDK stays on v2 for 10 minutes, then tries v3 again. The v3 streams are
+long-lived and reconnect with backoff; an item sent while a stream waits for its next attempt gets
+`livedata.ErrReconnecting`, and the first item sent to a v2-only platform can be lost before the
+SDK switches. remote-control serves `EdgeGatewayService`: point the SDK at it with
+`WithRemoteControlAddr` unless the main endpoint multiplexes it. The v2 telemetry API
+(`ProduceTelemetryData`, `ProduceTelemetry`) is unchanged.
+
+- **Params** are validated against the command's input schema before the handler runs; whole
+  numbers under an `integer` property arrive as `int64`, every other number as `float64`. A mismatch
+  is `REJECTED` with error code `command.invalid_params` and a message naming each field.
+- **Risk:** every capability carries a `CommandSafety`. A standard id gets the rating of the
+  platform's command catalog (`domains.CatalogSafety`, e.g. `flight.takeoff` MOVE, `flight.land`
+  CRITICAL); `adapter.WithSafety(...)` / `adapter.WithRisk(domains.CommandRiskCritical)` overrides
+  it. A `vendor.*` command that moves or affects the asset must declare its own: an id outside the
+  catalog declares none, and the platform then falls back to the 2.x prefix rule.
+- **Pairing:** `client.EnsureAsset(ctx, asset)` binds to the asset with that serial or, when the
+  platform does not know it, redeems the one-time claim code (`WithClaimCode`, default
+  `ZQNT_CLAIM_CODE`) minted in the console; the claim decides the organization.
+  `Connector().DescribeAssetClaim` names that organization without spending the code. An adapter
+  cannot create an asset any other way: `Connector().RegisterAsset` was removed in 3.0.
+- **Telemetry fields:** `DeclareTelemetryField` on the registry declares the keys of
+  `TelemetrySample.Details`; they are published with the capabilities. Keys of the platform's
+  catalog (`github.com/zequent/zqnt-api-go/v3/telemetry`, e.g. `dock.mode`, `wind.speed`)
+  are described by `domains.StandardTelemetryField` and also reach a v2 platform.
+- **Payloads:** `SetPayloads(sn, payloads)` on the registry sets the devices mounted on an asset
+  (camera, speaker, spotlight, ...), published with the capabilities as a full snapshot: a payload
+  left out is detached. A command acting on one is registered with
+  `WithTarget(domains.CapabilityTargetPayload, payload.Ref)`.
+- **Conformance kit:** `conformance.Run(t, adapter, conformance.Options{Events: recorder})` checks
+  that every advertised id executes, every executable id is advertised, schemas parse and an
+  `ACCEPTED` command is completed by an event with `occurred_at`. It executes commands — run it
+  against fakes or a simulator. Publish events through `adapter.CommandEventPublisher` so the kit's
+  `Recorder` can stand in for the client.
+
+## Migrating from 2.x
+
+Module path: `github.com/Zequent/zqnt-edge-sdk-go/v2` → `github.com/zequent/zqnt-edge-sdk-go/v3`
+(lower-case owner, as for every other Zequent Go module). Generated types come from
+`github.com/zequent/zqnt-api-go/v3/gen/...` (same package paths below `gen/`):
+
+```bash
+grep -rl zqnt-edge-sdk-go/v2 --include='*.go' . | xargs sed -i \
+  's#github.com/Zequent/zqnt-edge-sdk-go/v2#github.com/zequent/zqnt-edge-sdk-go/v3#g'
+go get github.com/zequent/zqnt-edge-sdk-go/v3 && go mod tidy
+```
+
 ## v2.0.0: the 2.0.0 wire contract
 
 This line targets the platform's current contract — `zqnt-protos` `2.0.1` (the `2.0.0` contract
@@ -67,13 +130,10 @@ plus `simulator-control.proto`), the exact commit `utils/zqnt-utils` (Java) and 
 contract for customers still integrated against `edge-java-sdk` v1.3.0; that line is now behind
 the running platform, not compatible with it.
 
-Per Go's semantic import versioning the module path carries the major version from here on:
-`github.com/Zequent/zqnt-edge-sdk-go/v2`.
-
-**Proto source**: no local generation in this repo (no `buf.gen.yaml`, no `gen/`). Stubs come from
-[`github.com/zequent/zqnt-utils-golang/v2`](../../../utils/zqnt-utils-golang) `v2.0.0` — a
-published, versioned dependency, mirroring how `edge-java-sdk` depends on `zqnt-utils-java` and
-`edge-python-sdk` on the `zqnt-utils` pip package, rather than generating proto code inline.
+**Proto source**: no local generation in this repo (no `buf.gen.yaml`, no `gen/`). Stubs and the
+telemetry mapping come from the public module
+[`github.com/zequent/zqnt-api-go/v3`](https://github.com/Zequent/zqnt-api-go), the platform’s
+customer contracts; the SDK depends on nothing else of the platform.
 
 **What actually moved, and what didn't.** `edge.proto`, `common.proto`, `live-data.proto`,
 `live-data-types.proto`, `remote-control.proto` and `simulator-control.proto` are byte-identical
@@ -144,14 +204,14 @@ connector/live-data/remote-control/mission-autonomy stack.
 
 **The simulator built on this SDK lives in its own repo**,
 [`github.com/Zequent/zqnt-simulator`](https://github.com/Zequent/zqnt-simulator) — a standalone
-service depending on `github.com/Zequent/zqnt-edge-sdk-go/v2` as a real tagged dependency, the same
+service depending on `github.com/zequent/zqnt-edge-sdk-go/v3` as a real tagged dependency, the same
 way any other adapter built on this SDK would.
 
 ### Local development
 
-`go.mod` points at a published version of `zqnt-utils-golang/v2`, so a clone and CI resolve it
-without any local setup. While the v2 line is still in review that's the PR preview build
-(`pr-<n>-<sha>`, resolved as a pseudo-version); it becomes `v2.0.0` when that release is cut.
+`go.mod` points at a published version of `zqnt-api-go`, so a clone and CI resolve it
+without any local setup. While the v3 line is still in review that's the PR preview build
+(`pr-<n>-<sha>`, resolved as a pseudo-version); it becomes `v3.0.0` when that release is cut.
 
 To build against the sibling monorepo checkout instead, use a **Go workspace** — never a committed
 `replace`, which would break every consumer outside a full `zqnt-platform` tree:
